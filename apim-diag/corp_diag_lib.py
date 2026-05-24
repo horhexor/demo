@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -157,6 +158,10 @@ class DiagConfig:
     no_portfolio_polish: bool = True
     no_per_trailhead_polish: bool = False
     max_concurrency: int = 12
+    # Stage 5g — opt-in cross-run hardening for decomposer:
+    decomposer_ledger_path: str | None = None
+    decomposer_cache_root: str | None = None
+    decomposer_run_id: str | None = None
 
 
 @dataclasses.dataclass
@@ -246,6 +251,10 @@ _CONFIG_SCHEMA: tuple[tuple[str, str | None, Any, type], ...] = (
     ("diag.no_portfolio_polish",        "CORP_DIAG_NO_PORTFOLIO_POLISH", True,        bool),
     ("diag.no_per_trailhead_polish",    "CORP_DIAG_NO_PER_TRAILHEAD_POLISH", False,   bool),
     ("diag.max_concurrency",            "CORP_DIAG_MAX_CONCURRENCY",   12,            int),
+    # Stage 5g — opt-in cross-run hardening for the decomposer phase
+    ("diag.decomposer_ledger_path",     "CORP_DIAG_DECOMPOSER_LEDGER", None,          str),
+    ("diag.decomposer_cache_root",      "CORP_DIAG_DECOMPOSER_CACHE",  None,          str),
+    ("diag.decomposer_run_id",          "CORP_DIAG_DECOMPOSER_RUN_ID", None,          str),
 )
 
 
@@ -863,6 +872,207 @@ def emit_call_metric(metric: CallMetric) -> None:
     if metric.final_status == "pending":
         metric.final_status = "unknown"
     logger.info("CALL_METRIC %s", json.dumps(metric.to_dict(), separators=(",", ":")))
+
+
+# Stage 5g.1 — content-derived keys (mirrors wolfpack/extraction_cache.py)
+
+
+def compute_call_batch_key(
+    input_data: Any,
+    *,
+    call_type: str,
+    prompt_version: str,
+    deployment: str,
+    max_completion_tokens: int | None,
+) -> str:
+    fingerprint = {
+        "input_data": input_data,
+        "call_type": call_type,
+        "prompt_version": prompt_version,
+        "deployment": deployment,
+        "max_completion_tokens": max_completion_tokens,
+    }
+    blob = json.dumps(fingerprint, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def compute_report_id(path: Path | str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
+
+
+# Stage 5g.2 — StatusLedger (mirrors wolfpack/extraction_cache.py)
+
+_OK_STATUSES = frozenset({"ok"})
+
+
+class StatusLedger:
+    """Append-only JSONL recording every batch attempt's outcome."""
+
+    def __init__(self, path: Path | str) -> None:
+        self.path = Path(path)
+        self._ledger_lock = threading.Lock()
+
+    def append(self, record: dict[str, Any]) -> None:
+        row = dict(record)
+        row.setdefault(
+            "ts",
+            datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        )
+        line = json.dumps(row, separators=(",", ":"), ensure_ascii=False)
+        with self._ledger_lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+
+    def _iter_rows(self):
+        if not self.path.is_file():
+            return
+        with open(self.path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+    def latest_per_batch(self, report_id: str) -> dict[str, dict[str, Any]]:
+        latest: dict[str, dict[str, Any]] = {}
+        for row in self._iter_rows():
+            if row.get("report_id") != report_id:
+                continue
+            bk = row.get("batch_key")
+            if bk is None:
+                continue
+            latest[bk] = row
+        return latest
+
+    def pending_batches(self, report_id: str) -> set[str]:
+        return {
+            bk
+            for bk, row in self.latest_per_batch(report_id).items()
+            if row.get("status") not in _OK_STATUSES
+        }
+
+
+# Stage 5g.4 — per_phase cache (parsed-output flavor).
+# Scope: per_phase outputs only. Bridge + polish stay always-fresh (mirrors
+# wolfpack/trailheads/decomposer_cache.py rationale).
+
+
+def read_cached_per_phase_parsed(
+    *,
+    cache_root: Path | str,
+    report_id: str,
+    batch_key: str,
+    output_model: type,
+) -> Any | None:
+    cache_root = Path(cache_root)
+    path = cache_root / report_id / f"{batch_key}.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return output_model.model_validate(data)
+    except Exception as exc:
+        logger.warning("per_phase cache read failed for %s: %s", path, exc)
+        return None
+
+
+def write_cached_per_phase_parsed(
+    *,
+    cache_root: Path | str,
+    report_id: str,
+    batch_key: str,
+    parsed: Any,
+) -> None:
+    cache_root = Path(cache_root)
+    path = cache_root / report_id / f"{batch_key}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = parsed.model_dump(mode="json")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(
+        json.dumps(payload, separators=(",", ":"), ensure_ascii=False),
+        encoding="utf-8",
+    )
+    os.replace(tmp, path)
+
+
+def cached_per_phase_dispatch(
+    *,
+    batch_key: str,
+    report_id: str | None,
+    cache_root: Path | str | None,
+    output_model: type,
+    invoke_fn,
+) -> tuple[Any | None, str]:
+    """Cache-aware wrapper around a per_phase invoke.
+
+    Returns ``(result, source)`` where source is one of:
+      - ``"cache"`` — cache hit; invoke_fn was NOT called
+      - ``"fresh"`` — cache miss + invoke returned a non-None parsed output
+        (cache was also written)
+      - ``"failed"`` — invoke returned None (no cache write)
+
+    When cache is disabled (``cache_root is None`` or ``report_id is None``),
+    invoke_fn is always called and cache is never read/written.
+    """
+    cache_enabled = cache_root is not None and report_id is not None
+    if cache_enabled:
+        cached = read_cached_per_phase_parsed(
+            cache_root=cache_root, report_id=report_id,
+            batch_key=batch_key, output_model=output_model,
+        )
+        if cached is not None:
+            return cached, "cache"
+
+    result = invoke_fn()
+
+    if cache_enabled and result is not None:
+        write_cached_per_phase_parsed(
+            cache_root=cache_root, report_id=report_id,
+            batch_key=batch_key, parsed=result,
+        )
+    return result, ("fresh" if result is not None else "failed")
+
+
+def write_decomposer_ledger_entry(
+    *,
+    ledger: "StatusLedger | None",
+    report_id: str | None,
+    run_id: str | None,
+    call_type: str,
+    batch_key: str,
+    context_label: str,
+    metric: "CallMetric",
+) -> None:
+    """Append a status-ledger row for one decomposer LLM call.
+
+    No-op when ``ledger is None`` or ``report_id is None``. Mirrors
+    wolfpack/extraction_cache.py:write_decomposer_ledger_entry.
+    """
+    if ledger is None or report_id is None:
+        return
+    status = metric.final_status or "unknown"
+    error_class: str | None = None
+    if metric.attempts:
+        error_class = metric.attempts[-1].error_class
+    behaviors_count = int(metric.payload.get("trailheads_produced", 0) or 0)
+    ledger.append({
+        "report_id": report_id,
+        "batch_key": batch_key,
+        "status": status,
+        "error_class": error_class,
+        "anchors": [context_label],
+        "behaviors_count": behaviors_count,
+        "run_id": run_id or "unknown",
+        "call_type": call_type,
+    })
 
 
 def _salvage_truncated_json_array(text: str) -> tuple[list[dict], str]:

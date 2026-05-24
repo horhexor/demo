@@ -213,6 +213,9 @@ python diag_repro_decomposer.py \
 | `--token-chaos-seed` | `chaos.token_chaos_seed` | Same. |
 | `-v / --verbose` | `diag.verbose` | DEBUG logging. |
 | `--show-config` | n/a | Print resolved config + source per value, then exit. |
+| `--decomposer-ledger` | `diag.decomposer_ledger_path` | Path to JSONL status ledger. Opt-in; enables **cross-run resume** + per-call audit. See "Cross-run resume + cache" below. |
+| `--decomposer-cache-root` | `diag.decomposer_cache_root` | Directory root for **per_phase** output cache. Same key derivation as the wolfpack decomposer's Stage 5d cache. Bridge + polish always run fresh (by design). |
+| `--decomposer-run-id` | `diag.decomposer_run_id` | Free-form id stored in ledger rows. Useful for distinguishing back-to-back runs in audits. |
 
 ### Call-type breakdown
 
@@ -256,6 +259,85 @@ WOLFPACK_MAX_COMPLETION_TOKENS=1024 python diag_repro_decomposer.py ... \
 # Corp-tolerant shape: skip polish + tight concurrency
 python diag_repro_decomposer.py ... --no-per-trailhead-polish --max-concurrency 4
 ```
+
+### Cross-run resume + cache (opt-in)
+
+The decomposer diag also wires the same **status-ledger + per_phase cache**
+pattern the production decomposer uses. Off by default; enable by setting
+`--decomposer-ledger` (and optionally `--decomposer-cache-root`).
+
+```bash
+# Run 1: enable ledger + cache
+python diag_repro_decomposer.py \
+    --bundle-path .../50_behavior_cluster_bundle_adjudicated.json \
+    --behaviors-path .../10_atomic_behaviors_candidate.json \
+    --reports-dir .../threat-reports \
+    --decomposer-ledger     ./outputs/decomposer-status-ledger.jsonl \
+    --decomposer-cache-root ./outputs/decomposer-cache \
+    --decomposer-run-id     run-1
+
+# Run 2: same flags → per_phase cache hits skip already-done LLM calls;
+#                    ledger records each batch's latest status.
+python diag_repro_decomposer.py ... \
+    --decomposer-ledger     ./outputs/decomposer-status-ledger.jsonl \
+    --decomposer-cache-root ./outputs/decomposer-cache \
+    --decomposer-run-id     run-2
+```
+
+What lands on disk:
+
+- `decomposer-status-ledger.jsonl` — one row per LLM call, with
+  `{report_id, batch_key, call_type, status, error_class, run_id, ts, ...}`.
+  Latest-row-wins per `(report_id, batch_key)`: a `schema_fail` followed by
+  an `ok` is treated as `ok`.
+- `decomposer-cache/<report_id>/<batch_key>.json` — pydantic-serialized
+  per_phase output for each successful per_phase call. `bridge` and
+  `per_trailhead_polish` calls are **not** cached (always re-run by
+  design — they're sensitive to inputs that change across runs).
+
+Why per_phase only: per_phase calls are parallel + independent, so a
+cache hit is a clean skip. Bridge depends on the set of primaries
+(non-deterministic), and polish interacts with portfolio arbitration —
+caching either is a quality risk for no real cost win.
+
+The diag's ledger + cache files are **byte-compatible** with the
+wolfpack production decomposer's Stage 5d cache (same `compute_call_batch_key`
+hash, same serialization). You can use one to seed the other.
+
+---
+
+## Single-file paste artifact
+
+`diag_repro_decomposer_bundled.py` is an auto-generated single-file build
+of the decomposer diag that **inlines `corp_diag_lib.py`** via an exec
+shim. It exists for cases where copying the whole `apim-diag/` directory
+to a corp box is awkward — you can paste this one file (plus optionally
+`corp_diag_config.yaml`, env vars also work) and run.
+
+```bash
+# Same CLI, same behavior, same ledger + cache files:
+python diag_repro_decomposer_bundled.py \
+    --bundle-path ... --behaviors-path ... --reports-dir ... \
+    --decomposer-ledger     ./outputs/ledger.jsonl \
+    --decomposer-cache-root ./outputs/cache
+```
+
+The bundled file is byte-compatible with the multi-file `diag_repro_decomposer.py`:
+both produce the same `report_id`, the same per_phase `batch_key`s, and
+write/read the same cache file format. You can interleave runs of both
+versions against a shared cache + ledger directory.
+
+**Regenerating after lib/diag edits:**
+
+```bash
+python bundle_decomposer.py
+```
+
+The bundler reads `corp_diag_lib.py` + `diag_repro_decomposer.py`, embeds
+the lib as an exec'd string with a synthetic module shim so the diag's
+`lib.X` references work unchanged, and writes the result to
+`diag_repro_decomposer_bundled.py`. Re-run whenever either source file
+changes. The bundled file is in git; the bundler is just a build tool.
 
 ---
 
@@ -433,7 +515,7 @@ and **failure-mode surfaces** that match the corp behavior documented in
 `__human-notes/APIM-Analysis.md`.
 
 Use case: validate a resilience change against corp-like delays
-*without waiting until Monday* to hit corp load. The personal APIM mimic
+*without waiting until Monday* to hit corp load. The personal-tenant APIM mimic
 alone doesn't reproduce the corp's 50-90s front-door queueing — the
 wrapper does.
 
@@ -608,7 +690,7 @@ status hides.
   it recovers 6/7 truncated windows with a cheap remainder call), but
   the diag deliberately doesn't, so you can see the raw truncation rate
   before recovery masks it.
-- **The personal APIM mimic is structurally corp-shaped but not
+- **The personal-tenant APIM mimic is structurally corp-shaped but not
   behaviorally corp-shaped** — that's what the local
   `apim_mimic.py` (in the sibling `apim-mimic/` folder) is for. Run through the wrapper when you want
   the latency distribution to match real corp.
@@ -618,12 +700,16 @@ status hides.
 ## Related files
 
 ```
-apim-diag/                       ← this folder
-├── corp_diag_config.yaml        ← single source of truth for all settings
-├── corp_diag_lib.py             ← shared library (auth, retry, instrumentation, config)
-├── diag_repro.py                ← extraction-phase diagnostic
-├── diag_repro_decomposer.py     ← decomposer-phase diagnostic
-└── README.md                    ← this file
+apim-diag/                              ← this folder
+├── corp_diag_config.yaml               ← single source of truth for all settings
+├── corp_diag_lib.py                    ← shared library (auth, retry, instrumentation,
+│                                          ledger + per_phase cache, config)
+├── diag_repro.py                       ← extraction-phase diagnostic
+├── diag_repro_decomposer.py            ← decomposer-phase diagnostic (multi-file)
+├── diag_repro_decomposer_bundled.py    ← decomposer diag, single-file (lib inlined).
+│                                          Auto-generated — see bundle_decomposer.py.
+├── bundle_decomposer.py                ← build tool: regenerates the bundled file.
+└── README.md                           ← this file
 
 apim-mimic/                      ← separate sibling folder (the fake APIM)
 ├── apim_mimic.py                ← local FastAPI service that mimics corp APIM behavior

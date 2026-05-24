@@ -30,7 +30,7 @@
 #                             (+ optional `.local.yaml` sibling). Set
 #                             `profile.yaml_path` (or the LLM_PROFILES_PATH env
 #                             var) to point at e.g.
-#                             <path-to-llm-profiles>.yaml
+#                             <path-to>/predator/llm-profiles.yaml
 #                             so apim-diag picks up the same auth values
 #                             wolfpack uses.
 profile:

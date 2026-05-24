@@ -224,3 +224,43 @@ Based on Run 1 + Run 2 outcomes:
 - Config: `apim-diag/corp_diag_config.yaml`
 - Tests (for reference): `apim-diag/test_corp_diag_lib_chaos_sync.py`,
   `apim-diag/test_diag_repro_continuation.py`
+
+---
+
+## Appendix — testing the decomposer phase in corp
+
+The decomposer-phase diagnostic (`diag_repro_decomposer.py`) follows the
+same pattern as `diag_repro.py` (single log file, `CALL_METRIC` JSON
+lines, `--show-config`, `--token-chaos-*` flags). What's different in
+corp validation:
+
+- **Larger calls.** Per_phase prompts run ~4000-4500 tokens in,
+  1300-1700 out. `--max-completion-tokens 2048` is the realistic shape;
+  `1024` will truncate almost every call. Bump it.
+- **Single-file paste.** Bringing the whole `apim-diag/` directory to a
+  corp box is sometimes painful. `diag_repro_decomposer_bundled.py`
+  inlines `corp_diag_lib.py` so you can paste just the one file (plus
+  `corp_diag_config.yaml`, or env vars). Same CLI, same behavior.
+- **Cross-run resume.** Pass `--decomposer-ledger ./outputs/ledger.jsonl`
+  and `--decomposer-cache-root ./outputs/cache` to make the diag survive
+  partial failures: a rerun with the same flags will reuse per_phase
+  outputs from the prior run (cache hits skip the LLM) and the ledger
+  records the latest status for each batch.
+
+Both the multi-file and the bundled version write to the same
+ledger/cache layout, so you can interleave them safely.
+
+```powershell
+# Single-file paste, corp shape, with cross-run safety net:
+python diag_repro_decomposer_bundled.py `
+    --bundle-path <...>/50_behavior_cluster_bundle_adjudicated.json `
+    --behaviors-path <...>/10_atomic_behaviors_candidate.json `
+    --reports-dir <...>/threat-reports-dir `
+    --outputs-root .\outputs\diag-decomposer-corp `
+    --max-completion-tokens 2048 `
+    --no-per-trailhead-polish `
+    --decomposer-ledger     .\outputs\decomposer-ledger.jsonl `
+    --decomposer-cache-root .\outputs\decomposer-cache `
+    --decomposer-run-id     corp-baseline-1 `
+    -v
+```
