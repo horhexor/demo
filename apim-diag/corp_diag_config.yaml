@@ -1,0 +1,140 @@
+# ============================================================================
+# corp_diag_config.yaml — single source of truth for all corp diagnostic tools.
+# ============================================================================
+#
+# Used by:
+#   - diag_repro.py              (extraction phase diagnostic)
+#   - diag_repro_decomposer.py   (trailhead/decomposer phase diagnostic)
+#   - corp_mimic_wrapper.py      (local corp-mimic delay/failure injector)
+#   - corp_diag_lib.py           (shared library all three import from)
+#
+# Resolution precedence (highest wins):
+#   1. CLI flags (--max-completion-tokens, --token-chaos-rate, etc.)
+#   2. Environment variables (named alongside each value below)
+#   3. This file
+#   4. Built-in defaults in corp_diag_lib.py
+#
+# Debug: `python -m corp_diag_lib --show-config` prints every value with its
+# resolved source (cli|env|yaml|default), so there's never any mystery about
+# where a setting came from.
+# ============================================================================
+
+
+# ── 1. Profile + auth ───────────────────────────────────────────────────────
+#
+# How auth gets resolved. Two modes:
+#   profile.source: inline  → use the `auth:` block below directly. This is the
+#                             default — apim-diag is a standalone suite, not
+#                             coupled to wolfpack's llm-profiles file.
+#   profile.source: yaml    → read profile from a wolfpack `llm-profiles.yaml`
+#                             (+ optional `.local.yaml` sibling). Set
+#                             `profile.yaml_path` (or the LLM_PROFILES_PATH env
+#                             var) to point at e.g.
+#                             <path-to-llm-profiles>.yaml
+#                             so apim-diag picks up the same auth values
+#                             wolfpack uses.
+profile:
+  name: corp                                            # env: PREDATOR_PROFILE
+  source: inline                                        # env: CORP_DIAG_PROFILE_SOURCE  [inline|yaml]
+  yaml_path: null                                       # env: LLM_PROFILES_PATH  (path to wolfpack llm-profiles.yaml; null = auto-discover by walking up from this file)
+
+# Used when profile.source == "inline". Ignored when profile.source == "yaml".
+auth:
+  endpoint: "https://<your-apim>.azure-api.net/openai-compat"  # env: AZURE_OPENAI_ENDPOINT
+  deployment: "gpt-5-4"                                 # env: AZURE_OPENAI_DEPLOYMENT
+  api_version: "2024-12-01-preview"                     # env: AZURE_OPENAI_API_VERSION
+  api_surface: openai-compat                            # env: CORP_DIAG_API_SURFACE  [azure-native|openai-compat]
+  credential: DefaultAzureCredential                    # env: CORP_DIAG_CREDENTIAL  (only DefaultAzureCredential supported in diag)
+  scope: "https://ai.azure.com/.default"                # env: CORP_DIAG_SCOPE
+
+
+# ── 2. LLM call shape ──────────────────────────────────────────────────────
+llm:
+  # Output budget per call. Real corp has WOLFPACK_MAX_COMPLETION_TOKENS=1024
+  # in production; the APIM-Analysis.md doc showed this is too small for
+  # decomposer outputs (which want 1300-1700). Override via env to test.
+  max_completion_tokens: 1024                           # env: WOLFPACK_MAX_COMPLETION_TOKENS
+  request_timeout_s: 300                                # env: CORP_DIAG_REQUEST_TIMEOUT_S
+  max_retries: 3                                        # env: CORP_DIAG_MAX_RETRIES
+  retry_min_wait_s: 1                                   # env: CORP_DIAG_RETRY_MIN_WAIT_S
+  retry_max_wait_s: 30                                  # env: CORP_DIAG_RETRY_MAX_WAIT_S
+
+
+# ── 3. Token-acquisition chaos injection ───────────────────────────────────
+# Wraps the bearer-token callable so a configurable fraction of token calls
+# raise a simulated auth failure. Used to characterize how token errors flow
+# through resilient_invoke + tenacity.
+chaos:
+  token_chaos_rate: 0.0                                 # env: CORP_DIAG_TOKEN_CHAOS_RATE   [0.0..1.0]
+  token_chaos_error: random                             # env: CORP_DIAG_TOKEN_CHAOS_ERROR  [timeout|auth_error|connection|random]
+  token_chaos_seed: null                                # env: CORP_DIAG_TOKEN_CHAOS_SEED   (null = nondeterministic)
+
+
+# ── 4. Local corp-mimic wrapper ────────────────────────────────────────────
+# Consumed by corp_mimic_wrapper.py. The wrapper sits between a diag and the
+# real Foundry endpoint, injecting front-door delay + failure shapes that
+# match real corp APIM behavior per the APIM-Analysis.md observations.
+mimic:
+  host: "127.0.0.1"                                     # env: MIMIC_HOST
+  port: 8080                                            # env: MIMIC_PORT
+
+  # Backend the wrapper forwards to (bypassing APIM):
+  foundry_endpoint: "https://<your-foundry>.openai.azure.com"  # env: MIMIC_FOUNDRY_ENDPOINT
+  api_version: "2024-12-01-preview"                     # env: MIMIC_API_VERSION
+
+  # Load preset selector. If set, picks values from `load_presets` below.
+  # Per-knob settings (delay_min_ms etc.) override the preset where set.
+  load_mode: null                                       # env: MIMIC_LOAD_MODE  [null|light|moderate|heavy|severe]
+
+  # Front-door queueing delay sampled uniformly in [min, max] ms per call:
+  delay_min_ms: 0                                       # env: MIMIC_DELAY_MIN_MS
+  delay_max_ms: 0                                       # env: MIMIC_DELAY_MAX_MS
+
+  # Failure injection — probability per call to inject configured mode:
+  failure_rate: 0.0                                     # env: MIMIC_FAILURE_RATE  [0.0..1.0]
+  failure_mode: random                                  # env: MIMIC_FAILURE_MODE  [504|html_gateway_504|disconnect|timeout|random]
+
+  seed: null                                            # env: MIMIC_SEED  (RNG seed for reproducible chaos)
+
+  # APIM-emitted rate-limit header values, set to match real corp magnitudes
+  # (analysis observed 50000 / 5000000 in real corp; personal-tenant APIM emits
+  # 2500 / 250000 — too small to look corp-like).
+  rate_limit:
+    requests: 50000                                     # env: MIMIC_RATELIMIT_REQUESTS
+    tokens: 5000000                                     # env: MIMIC_RATELIMIT_TOKENS
+
+  # Latency bands for each failure shape, in seconds. Values from analysis:
+  #   504              → ~30s (historical clean-baseline 504)
+  #   html_gateway_504 → ~30s (Azure Application Gateway HTML 504)
+  #   disconnect       → ~134s (today's 80k-char disconnect)
+  #   timeout          → ~194s (Monday heavy-load 504-after-very-long-wait)
+  failure_bands:
+    "504":              { min_s: 28,  max_s: 32 }
+    "html_gateway_504": { min_s: 28,  max_s: 35 }
+    "disconnect":       { min_s: 120, max_s: 150 }
+    "timeout":          { min_s: 180, max_s: 210 }
+
+  # Load presets map operating-band labels to (delay range, failure rate).
+  # Numbers from APIM-Analysis.md "Predicted operating bands" table.
+  load_presets:
+    light:    { delay_min_ms:     0, delay_max_ms:      0, failure_rate: 0.00 }
+    moderate: { delay_min_ms: 20000, delay_max_ms:  60000, failure_rate: 0.02 }
+    heavy:    { delay_min_ms: 50000, delay_max_ms:  90000, failure_rate: 0.05 }
+    severe:   { delay_min_ms: 60000, delay_max_ms: 120000, failure_rate: 0.15 }
+
+
+# ── 5. Diagnostic harness defaults ─────────────────────────────────────────
+# Per-tool defaults; each tool's own CLI may add/override these.
+diag:
+  verbose: false                                        # env: CORP_DIAG_VERBOSE
+  outputs_root: "./outputs/diag"                        # env: CORP_DIAG_OUTPUTS_ROOT
+
+  # Extraction-specific (diag_repro.py):
+  extract_batch_size: 1                                 # env: CORP_DIAG_EXTRACT_BATCH_SIZE
+  extract_concurrency: 8                                # env: CORP_DIAG_EXTRACT_CONCURRENCY
+
+  # Decomposer-specific (diag_repro_decomposer.py):
+  decomposer: phase_aware_refined                       # env: CORP_DIAG_DECOMPOSER
+  no_portfolio_polish: true                             # env: CORP_DIAG_NO_PORTFOLIO_POLISH  (always true in diag scope)
+  no_per_trailhead_polish: false                        # env: CORP_DIAG_NO_PER_TRAILHEAD_POLISH
+  max_concurrency: 12                                   # env: CORP_DIAG_MAX_CONCURRENCY

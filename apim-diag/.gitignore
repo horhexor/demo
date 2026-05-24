@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local config / secrets (NEVER commit)
+.env
+.env.*
+*.local.yaml
+*.local.yml
+llm-profiles.local.yaml
+.aws/
+.azure/
+
+# Run outputs (large, run-specific, often contain prompt/response text)
+outputs/
+*-runs/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
