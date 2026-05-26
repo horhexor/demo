@@ -646,7 +646,25 @@ def make_chaotic_token_provider(
 # ----------------------------------------------------------------------------
 
 
-_thread_local = threading.local()
+# Stage 7.1 — APIM-header capture across threadpool boundaries.
+#
+# Earlier this was a threading.local. That broke for the decomposer's
+# structured-output path: `with_structured_output(include_raw=True)` uses
+# RunnableParallel, which dispatches the actual LLM call onto a
+# ThreadPoolExecutor worker. The httpx hooks fire on the WORKER thread,
+# populating that thread's local. The caller (reading on the main thread)
+# saw NULL — so all decomposer CallMetrics had `apim_request_id`,
+# `client_request_id`, ratelimit fields, etc., all NULL even though the
+# headers were present in the HTTP response.
+#
+# Fix: contextvar holding a MUTABLE dict. langchain's executor uses
+# `contextvars.copy_context().run()`, which snapshots the parent's
+# contextvar values into the worker — so the worker sees the SAME dict
+# reference. Mutations made by the worker hooks are visible to the parent
+# through that shared dict. Concurrent parents have separate contextvars
+# (since contextvars are context-scoped), so parallel per_phase calls
+# don't contaminate each other.
+import contextvars
 
 _APIM_HEADERS_OF_INTEREST = (
     "apim-request-id",
@@ -661,12 +679,26 @@ _APIM_HEADERS_OF_INTEREST = (
 )
 
 
+def _fresh_capture_box() -> dict[str, Any]:
+    return {"client_request_id": None, "last_headers": None, "last_status": None}
+
+
+# Default to a fresh box so callers can use the lib without explicitly
+# resetting first. Each `reset_thread_apim_state()` swaps in a NEW box
+# so any worker threads from prior calls (with stale refs) can't pollute
+# the new box.
+_apim_capture_var: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
+    "apim_capture_box", default=_fresh_capture_box(),
+)
+
+
 def _diag_request_hook(request: httpx.Request) -> None:
+    box = _apim_capture_var.get()
     cid = uuid.uuid4().hex
     request.headers["x-ms-client-request-id"] = cid
-    _thread_local.client_request_id = cid
-    _thread_local.last_headers = None
-    _thread_local.last_status = None
+    box["client_request_id"] = cid
+    box["last_headers"] = None
+    box["last_status"] = None
 
 
 def _diag_response_hook(response: httpx.Response) -> None:
@@ -675,16 +707,18 @@ def _diag_response_hook(response: httpx.Response) -> None:
         captured = {h: headers_lower.get(h) for h in _APIM_HEADERS_OF_INTEREST}
     except Exception:
         captured = {}
-    _thread_local.last_headers = captured
-    _thread_local.last_status = response.status_code
+    box = _apim_capture_var.get()
+    box["last_headers"] = captured
+    box["last_status"] = response.status_code
 
 
 def take_last_apim_capture() -> dict[str, Any]:
-    """Pop the latest per-thread APIM capture into a flat dict suitable
+    """Pop the latest contextvar-bound APIM capture into a flat dict suitable
     for the **apim splat in CallAttempt(...)."""
-    headers = getattr(_thread_local, "last_headers", None) or {}
-    cid = getattr(_thread_local, "client_request_id", None)
-    status = getattr(_thread_local, "last_status", None)
+    box = _apim_capture_var.get()
+    headers = box.get("last_headers") or {}
+    cid = box.get("client_request_id")
+    status = box.get("last_status")
 
     def _as_int(v: Any) -> int | None:
         try:
@@ -707,9 +741,9 @@ def take_last_apim_capture() -> dict[str, Any]:
 
 
 def reset_thread_apim_state() -> None:
-    _thread_local.last_headers = None
-    _thread_local.last_status = None
-    _thread_local.client_request_id = None
+    """Swap in a fresh capture box. Stale worker-thread references to the
+    old box become harmless (they mutate the discarded box)."""
+    _apim_capture_var.set(_fresh_capture_box())
 
 
 def build_diag_http_client(timeout: int) -> httpx.Client:
