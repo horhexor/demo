@@ -260,6 +260,49 @@ WOLFPACK_MAX_COMPLETION_TOKENS=1024 python diag_repro_decomposer.py ... \
 python diag_repro_decomposer.py ... --no-per-trailhead-polish --max-concurrency 4
 ```
 
+### Dynamic token-budget escalation (Layer 2, on by default)
+
+The decomposer's structured-output calls escalate `max_completion_tokens`
+whenever they hit `finish_reason=length`. Each escalation level retries the
+SAME prompt with a doubled budget (`1024 → 2048 → 4096 → 8192`), recording
+the budget journey in `CallMetric.payload.budget_attempts`. This sits ABOVE
+the tenacity retry layer — Layer 1 handles transient HTTP errors, Layer 2
+handles output-shape failures from chatty gpt-5.x reasoning eating the cap.
+
+Why this matters: with a static `max_completion_tokens`, gpt-5.x's
+non-deterministic reasoning length means the same prompt can succeed once
+and truncate the next time. The escalation layer adapts per-call: if 1024
+truncates, try 2048; if 2048 truncates, try 4096; eventually succeed or hit
+the corp APIM's 30s cap (which surfaces as a transient timeout to Layer 1).
+
+Per-call-type initial budgets:
+
+| Call type | Initial budget | Env override |
+|---|---|---|
+| `per_phase` | 1024 | `CORP_DIAG_PER_PHASE_INITIAL_BUDGET` |
+| `bridge` | 2048 (denser prompt) | `CORP_DIAG_BRIDGE_INITIAL_BUDGET` |
+| `per_trailhead_polish` | 1024 | `CORP_DIAG_POLISH_INITIAL_BUDGET` |
+
+Globally tunable:
+
+| Setting | Default | Env override |
+|---|---|---|
+| Escalation factor (multiplier per attempt) | 2.0 | `CORP_DIAG_ESCALATION_FACTOR` |
+| Max escalation attempts | 4 | `CORP_DIAG_ESCALATION_MAX_ATTEMPTS` |
+
+Each CallMetric grows two new payload fields:
+```json
+"payload": {
+  "budget_attempts": [1024, 2048, 4096],
+  "escalation_status": "ok"  // or "truncation_exhausted"
+}
+```
+
+When all escalation attempts truncate (`truncation_exhausted`), the result
+is recorded in the ledger as `schema_fail` — the cross-run retry pattern
+(`--decomposer-ledger` + `--decomposer-cache-root`, below) picks them up
+on next run while cached successes are skipped.
+
 ### Cross-run resume + cache (opt-in)
 
 The decomposer diag also wires the same **status-ledger + per_phase cache**

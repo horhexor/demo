@@ -1178,6 +1178,21 @@ def _process_structured_result(
 _DIAG_DECOMPOSER_PROMPT_VERSION = "phase_aware_refined-2026-05-A"
 
 
+def _is_structured_result_truncated(result) -> bool:
+    """Layer 2 truncation check for structured-output dict results.
+
+    `result` shape is {'parsed': <model>, 'raw': <AIMessage>}. Truncation is
+    indicated by raw.response_metadata.finish_reason == 'length'.
+    """
+    if not isinstance(result, dict):
+        return False
+    raw = result.get("raw")
+    if raw is None:
+        return False
+    metadata = getattr(raw, "response_metadata", {}) or {}
+    return metadata.get("finish_reason") == "length"
+
+
 def invoke_per_phase(
     llm: ChatOpenAI,
     *,
@@ -1225,9 +1240,19 @@ def invoke_per_phase(
     )
     metric.prompt_chars = len(sys_prompt) + len(user_prompt)
     messages = [SystemMessage(content=sys_prompt), HumanMessage(content=user_prompt)]
-    structured = llm.with_structured_output(
-        ChatRecipeGeneratorOutput, include_raw=True, method="function_calling",
-    )
+
+    # Stage 6.1: Layer 2 invokable factory — rebinds max_completion_tokens
+    # per escalation level. .bind() lets us override invocation parameters
+    # without rebuilding the LLM client.
+    def _make_structured_invokable(budget: int):
+        # Stage 6.1: cannot use .bind() — with_structured_output() captures the
+        # LLM's kwargs at wrap time, so subsequent binds are lost. Use
+        # model_copy(update={"max_tokens": budget}) instead — langchain's
+        # ChatOpenAI stores max_completion_tokens as the max_tokens attribute,
+        # and model_copy on a pydantic model is cheap (no httpx/auth rebuild).
+        return llm.model_copy(update={"max_tokens": budget}).with_structured_output(
+            ChatRecipeGeneratorOutput, include_raw=True, method="function_calling",
+        )
 
     # Stage 5g: derive batch_key for ledger correlation + cache addressing.
     batch_key = lib.compute_call_batch_key(
@@ -1235,18 +1260,27 @@ def invoke_per_phase(
         call_type="per_phase",
         prompt_version=_DIAG_DECOMPOSER_PROMPT_VERSION,
         deployment=config.auth.deployment,
-        max_completion_tokens=config.llm.max_completion_tokens,
+        max_completion_tokens=config.llm.per_phase_initial_budget,
     )
 
     def _invoke_llm() -> ChatRecipeGeneratorOutput | None:
         try:
             try:
-                result = lib.resilient_invoke(
-                    structured, messages,
+                budget_journey: list[int] = []
+                result, escalation_status = lib.invoke_with_token_escalation(
+                    invokable_factory=_make_structured_invokable,
+                    payload=messages,
+                    is_truncated=_is_structured_result_truncated,
+                    initial_max_tokens=config.llm.per_phase_initial_budget,
+                    escalation_factor=config.llm.escalation_factor,
+                    max_attempts=config.llm.escalation_max_attempts,
                     config=config,
                     context=f"per_phase:{phase}",
                     attempts=metric.attempts,
+                    budget_journey_out=budget_journey,
                 )
+                metric.payload["budget_attempts"] = budget_journey
+                metric.payload["escalation_status"] = escalation_status
             except Exception as exc:
                 metric.final_status = (
                     "exhausted" if lib.is_transient_error(exc) else "non_transient"
@@ -1331,26 +1365,42 @@ def invoke_bridge(
     )
     metric.prompt_chars = len(sys_prompt) + len(user_prompt)
     messages = [SystemMessage(content=sys_prompt), HumanMessage(content=user_prompt)]
-    structured = llm.with_structured_output(
-        ChatRecipeGeneratorOutput, include_raw=True, method="function_calling",
-    )
+
+    def _make_structured_invokable(budget: int):
+        # Stage 6.1: cannot use .bind() — with_structured_output() captures the
+        # LLM's kwargs at wrap time, so subsequent binds are lost. Use
+        # model_copy(update={"max_tokens": budget}) instead — langchain's
+        # ChatOpenAI stores max_completion_tokens as the max_tokens attribute,
+        # and model_copy on a pydantic model is cheap (no httpx/auth rebuild).
+        return llm.model_copy(update={"max_tokens": budget}).with_structured_output(
+            ChatRecipeGeneratorOutput, include_raw=True, method="function_calling",
+        )
 
     batch_key = lib.compute_call_batch_key(
         {"primaries": [p.trailhead_id for p in primaries]},
         call_type="bridge",
         prompt_version=_DIAG_DECOMPOSER_PROMPT_VERSION,
         deployment=config.auth.deployment,
-        max_completion_tokens=config.llm.max_completion_tokens,
+        max_completion_tokens=config.llm.bridge_initial_budget,
     )
 
     try:
         try:
-            result = lib.resilient_invoke(
-                structured, messages,
+            budget_journey: list[int] = []
+            result, escalation_status = lib.invoke_with_token_escalation(
+                invokable_factory=_make_structured_invokable,
+                payload=messages,
+                is_truncated=_is_structured_result_truncated,
+                initial_max_tokens=config.llm.bridge_initial_budget,
+                escalation_factor=config.llm.escalation_factor,
+                max_attempts=config.llm.escalation_max_attempts,
                 config=config,
                 context="bridge",
                 attempts=metric.attempts,
+                budget_journey_out=budget_journey,
             )
+            metric.payload["budget_attempts"] = budget_journey
+            metric.payload["escalation_status"] = escalation_status
         except Exception as exc:
             metric.final_status = (
                 "exhausted" if lib.is_transient_error(exc) else "non_transient"
@@ -1408,7 +1458,7 @@ def invoke_per_trailhead_polish(
         call_type="per_trailhead_polish",
         prompt_version=_DIAG_DECOMPOSER_PROMPT_VERSION,
         deployment=config.auth.deployment,
-        max_completion_tokens=config.llm.max_completion_tokens,
+        max_completion_tokens=config.llm.polish_initial_budget,
     )
 
     sys_prompt = (
@@ -1424,18 +1474,34 @@ def invoke_per_trailhead_polish(
     )
     metric.prompt_chars = len(sys_prompt) + len(user_prompt)
     messages = [SystemMessage(content=sys_prompt), HumanMessage(content=user_prompt)]
-    structured = llm.with_structured_output(
-        ChatRecipeGeneratorOutput, include_raw=True, method="function_calling",
-    )
+
+    def _make_structured_invokable(budget: int):
+        # Stage 6.1: cannot use .bind() — with_structured_output() captures the
+        # LLM's kwargs at wrap time, so subsequent binds are lost. Use
+        # model_copy(update={"max_tokens": budget}) instead — langchain's
+        # ChatOpenAI stores max_completion_tokens as the max_tokens attribute,
+        # and model_copy on a pydantic model is cheap (no httpx/auth rebuild).
+        return llm.model_copy(update={"max_tokens": budget}).with_structured_output(
+            ChatRecipeGeneratorOutput, include_raw=True, method="function_calling",
+        )
 
     try:
         try:
-            result = lib.resilient_invoke(
-                structured, messages,
+            budget_journey: list[int] = []
+            result, escalation_status = lib.invoke_with_token_escalation(
+                invokable_factory=_make_structured_invokable,
+                payload=messages,
+                is_truncated=_is_structured_result_truncated,
+                initial_max_tokens=config.llm.polish_initial_budget,
+                escalation_factor=config.llm.escalation_factor,
+                max_attempts=config.llm.escalation_max_attempts,
                 config=config,
                 context=f"per_trailhead_polish:{trailhead.trailhead_id}",
                 attempts=metric.attempts,
+                budget_journey_out=budget_journey,
             )
+            metric.payload["budget_attempts"] = budget_journey
+            metric.payload["escalation_status"] = escalation_status
         except Exception as exc:
             metric.final_status = (
                 "exhausted" if lib.is_transient_error(exc) else "non_transient"

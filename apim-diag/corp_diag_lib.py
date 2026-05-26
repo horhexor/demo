@@ -103,6 +103,12 @@ class LLMConfig:
     max_retries: int = 3
     retry_min_wait_s: int = 1
     retry_max_wait_s: int = 30
+    # Stage 6.1 — Layer 2 dynamic token budget escalation
+    escalation_factor: float = 2.0
+    escalation_max_attempts: int = 4
+    per_phase_initial_budget: int = 1024
+    bridge_initial_budget: int = 2048
+    polish_initial_budget: int = 1024
 
 
 @dataclasses.dataclass
@@ -225,6 +231,12 @@ _CONFIG_SCHEMA: tuple[tuple[str, str | None, Any, type], ...] = (
     ("llm.max_retries",                 "CORP_DIAG_MAX_RETRIES",       3,             int),
     ("llm.retry_min_wait_s",            "CORP_DIAG_RETRY_MIN_WAIT_S",  1,             int),
     ("llm.retry_max_wait_s",            "CORP_DIAG_RETRY_MAX_WAIT_S",  30,            int),
+    # Stage 6.1 — Layer 2 dynamic token-budget escalation
+    ("llm.escalation_factor",           "CORP_DIAG_ESCALATION_FACTOR", 2.0,           float),
+    ("llm.escalation_max_attempts",     "CORP_DIAG_ESCALATION_MAX_ATTEMPTS", 4,       int),
+    ("llm.per_phase_initial_budget",    "CORP_DIAG_PER_PHASE_INITIAL_BUDGET", 1024,   int),
+    ("llm.bridge_initial_budget",       "CORP_DIAG_BRIDGE_INITIAL_BUDGET", 2048,      int),
+    ("llm.polish_initial_budget",       "CORP_DIAG_POLISH_INITIAL_BUDGET", 1024,      int),
     # chaos
     ("chaos.token_chaos_rate",          "CORP_DIAG_TOKEN_CHAOS_RATE",  0.0,           float),
     ("chaos.token_chaos_error",         "CORP_DIAG_TOKEN_CHAOS_ERROR", "random",      str),
@@ -1073,6 +1085,89 @@ def write_decomposer_ledger_entry(
         "run_id": run_id or "unknown",
         "call_type": call_type,
     })
+
+
+# ============================================================================
+# Stage 6.1 — Layer 2 resilience: dynamic token-budget escalation
+# ============================================================================
+#
+# When gpt-5.x structured-output calls return finish_reason=length, the call
+# is HTTP-clean but the parsed output is incomplete. Tenacity doesn't see this
+# (it's a successful HTTP). The wrapper below detects truncation, doubles the
+# budget, and retries the same prompt until success or max_attempts exhausted.
+#
+# Sits ABOVE resilient_invoke: each escalation level may itself trigger
+# tenacity retries on transient HTTP errors. Two independent layers.
+
+
+def invoke_with_token_escalation(
+    *,
+    invokable_factory,
+    payload,
+    is_truncated,
+    initial_max_tokens: int,
+    escalation_factor: float = 2.0,
+    max_attempts: int = 4,
+    config: Config,
+    context: str,
+    attempts: list[CallAttempt] | None = None,
+    budget_journey_out: list[int] | None = None,
+) -> tuple[Any, str]:
+    """Escalate max_completion_tokens on truncation; retry until success or exhausted.
+
+    Args:
+      invokable_factory: callable(budget:int) -> invokable with .invoke(payload).
+        Each escalation level builds a fresh invokable bound to the new budget.
+      payload: same payload passed to resilient_invoke (typically messages list).
+      is_truncated: callable(result) -> bool. Returns True if the result should
+        trigger escalation. Standard implementation checks
+        result.response_metadata.get("finish_reason") == "length".
+      initial_max_tokens: starting budget for the first attempt.
+      escalation_factor: budget multiplier per attempt (default 2.0 = doubling).
+      max_attempts: cap on escalation levels (default 4 → 1024→2048→4096→8192).
+      config: standard Config object (passes through to resilient_invoke).
+      context: log label.
+      attempts: optional list to append per-HTTP-call CallAttempt to.
+      budget_journey_out: optional list to append [budget1, budget2, ...] to.
+        Useful for CallMetric.payload.budget_attempts diagnostics.
+
+    Returns:
+      (result, status) where status is one of:
+        "ok"                   — call succeeded, no truncation
+        "truncation_exhausted" — all max_attempts truncated; returning last result
+
+    Propagates exceptions from resilient_invoke (e.g., transient_exhausted).
+    """
+    budget = initial_max_tokens
+    last_result: Any = None
+    for attempt_n in range(max_attempts):
+        if budget_journey_out is not None:
+            budget_journey_out.append(budget)
+        invokable = invokable_factory(budget)
+        sub_context = f"{context}@budget={budget}"
+        result = resilient_invoke(
+            invokable, payload,
+            context=sub_context,
+            config=config,
+            attempts=attempts,
+        )
+        last_result = result
+        if not is_truncated(result):
+            logger.info(
+                "Layer 2 [%s] succeeded at budget=%d (escalation_step=%d/%d)",
+                context, budget, attempt_n + 1, max_attempts,
+            )
+            return result, "ok"
+        logger.warning(
+            "Layer 2 [%s] truncated at budget=%d (step %d/%d); escalating",
+            context, budget, attempt_n + 1, max_attempts,
+        )
+        budget = int(budget * escalation_factor)
+    logger.warning(
+        "Layer 2 [%s] exhausted %d escalation attempts; returning last truncated result",
+        context, max_attempts,
+    )
+    return last_result, "truncation_exhausted"
 
 
 def _salvage_truncated_json_array(text: str) -> tuple[list[dict], str]:
