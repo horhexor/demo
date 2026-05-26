@@ -1,0 +1,71 @@
+# ============================================================================
+# apim_mimic config — every knob, with env-var name documented next to each.
+# ============================================================================
+#
+# Resolution precedence (highest wins):
+#   1. CLI flags (--load-mode, --delay-min-ms, etc.)
+#   2. Environment variables (named alongside each value below)
+#   3. This file
+#   4. Built-in defaults in apim_mimic.py
+#
+# Debug: `python apim_mimic.py --show-config` prints every value with its
+# resolved source (cli|env|yaml|default).
+
+# ── Network ────────────────────────────────────────────────────────────────
+host:               "127.0.0.1"                       # env: MIMIC_HOST
+port:               8080                              # env: MIMIC_PORT
+
+# ── Backend ────────────────────────────────────────────────────────────────
+# The mimic forwards each request to this Foundry deployment endpoint.
+# Bearer token from the incoming client is passed through unchanged.
+foundry_endpoint:   "https://aoai-<your-foundry>.openai.azure.com"  # env: MIMIC_FOUNDRY_ENDPOINT
+api_version:        "2024-12-01-preview"              # env: MIMIC_API_VERSION
+
+# ── Front-door delay simulation ────────────────────────────────────────────
+# Sampled uniformly in [delay_min_ms, delay_max_ms] before forwarding.
+# When `load_mode` is set, the preset below picks these values unless explicit
+# delay_min_ms / delay_max_ms are set (those win where >0).
+load_mode:          null                              # env: MIMIC_LOAD_MODE  [null|light|moderate|heavy|severe]
+delay_min_ms:       0                                 # env: MIMIC_DELAY_MIN_MS
+delay_max_ms:       0                                 # env: MIMIC_DELAY_MAX_MS
+
+# ── Failure injection ──────────────────────────────────────────────────────
+# Probability per call to inject the configured `failure_mode`. When
+# `load_mode` is set and failure_rate is 0, the preset's failure_rate is used.
+failure_rate:       0.0                               # env: MIMIC_FAILURE_RATE   [0.0..1.0]
+failure_mode:       random                            # env: MIMIC_FAILURE_MODE
+                                                      # [504|html_gateway_504|disconnect|timeout|auth_error|connection|random]
+
+seed:               null                              # env: MIMIC_SEED  (RNG seed for reproducible chaos)
+verbose:            false                             # env: MIMIC_VERBOSE
+
+# ── APIM rate-limit header values ──────────────────────────────────────────
+# Emitted on every response. Set to corp-magnitude values so client-side
+# diagnostics see realistic headroom numbers.
+rate_limit:
+  requests:         50000                             # env: MIMIC_RATELIMIT_REQUESTS
+  tokens:           5000000                           # env: MIMIC_RATELIMIT_TOKENS
+
+# ── Failure latency bands (when chaos fires) ───────────────────────────────
+# Each failure_mode sleeps a sampled duration in [min_s, max_s] before
+# returning the response. Numbers from APIM-Analysis.md observations:
+#   504              ~30s   (historical clean-baseline 504s)
+#   html_gateway_504 ~30s   (Application Gateway HTML 504 from a multi-hop layer)
+#   disconnect       ~134s  (today's 80k-char input disconnect)
+#   timeout          ~194s  (Monday heavy-load 504-after-very-long-wait)
+failure_bands:
+  "504":              { min_s: 28,  max_s: 32 }
+  "html_gateway_504": { min_s: 28,  max_s: 35 }
+  "disconnect":       { min_s: 120, max_s: 150 }
+  "timeout":          { min_s: 180, max_s: 210 }
+
+# ── Load presets ───────────────────────────────────────────────────────────
+# `--load-mode <name>` maps to (delay range, failure rate). Numbers from
+# APIM-Analysis.md "Predicted operating bands" table.
+load_presets:
+  # Stage 6.4: truncation_rate scales with load-mode severity, simulating
+  # corp gpt-5.x's dice-roll truncation under load.
+  light:    { delay_min_ms:     0, delay_max_ms:      0, failure_rate: 0.00, truncation_rate: 0.25 }
+  moderate: { delay_min_ms: 20000, delay_max_ms:  60000, failure_rate: 0.02, truncation_rate: 0.50 }
+  heavy:    { delay_min_ms: 50000, delay_max_ms:  90000, failure_rate: 0.05, truncation_rate: 0.75 }
+  severe:   { delay_min_ms: 60000, delay_max_ms: 120000, failure_rate: 0.15, truncation_rate: 0.90 }
