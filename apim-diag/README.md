@@ -63,7 +63,7 @@ Both scripts:
        (extraction)              (decomposer)
              │                            │
              ▼                            ▼
-       LLM endpoint (real corp APIM, personal-tenant APIM, or corp_mimic_wrapper)
+       LLM endpoint (real corp APIM, Byteprose APIM, or corp_mimic_wrapper)
 ```
 
 All shared infrastructure lives in `corp_diag_lib.py`. Both tools only own
@@ -558,7 +558,7 @@ and **failure-mode surfaces** that match the corp behavior documented in
 `__human-notes/APIM-Analysis.md`.
 
 Use case: validate a resilience change against corp-like delays
-*without waiting until Monday* to hit corp load. The personal-tenant APIM mimic
+*without waiting until Monday* to hit corp load. The Byteprose APIM mimic
 alone doesn't reproduce the corp's 50-90s front-door queueing — the
 wrapper does.
 
@@ -706,11 +706,12 @@ real failures earlier in the project:
 | Token usage | ✓ | ✓ |
 | `finish_reason` per call | ✗ (silently absorbed) | ✓ (separately tracked + histogrammed) |
 | Per-attempt retry detail | partial | ✓ (every attempt logged with its own latency + APIM headers) |
-| Error classification | binary (transient vs not) | 11 distinct classes |
-| APIM correlation headers | not captured | every header in every attempt |
+| Error classification | binary (transient vs not) | 12 distinct classes |
+| APIM correlation headers | not captured | every header in every attempt — **and now populated across the structured-output threadpool path** (Stage 7.1 contextvar fix; verified 5/5 populated in Stage 8.2 cross-chaos runs) |
 | Outbound `x-ms-client-request-id` | **always "Not-Set"** | unique UUID per HTTP attempt |
 | Failure mode breakdown | "ok_with_failures" status | per-status `final_status_breakdown` |
 | Per-call-type breakdown (decomposer) | no | `by_call_type` summary |
+| Layer 2 budget journey | n/a (added Stage 6) | `CallMetric.payload.budget_attempts: [1024, 2048, 4096, ...]` per call + `escalation_status: ok\|truncation_exhausted` |
 
 If you run a wolfpack run and a diag run side-by-side on the same
 inputs, the diag will surface failure modes that wolfpack's "completed"
@@ -733,7 +734,7 @@ status hides.
   it recovers 6/7 truncated windows with a cheap remainder call), but
   the diag deliberately doesn't, so you can see the raw truncation rate
   before recovery masks it.
-- **The personal-tenant APIM mimic is structurally corp-shaped but not
+- **The Byteprose APIM mimic is structurally corp-shaped but not
   behaviorally corp-shaped** — that's what the local
   `apim_mimic.py` (in the sibling `apim-mimic/` folder) is for. Run through the wrapper when you want
   the latency distribution to match real corp.
