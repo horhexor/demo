@@ -135,6 +135,6 @@ diag:
 
   # Decomposer-specific (diag_repro_decomposer.py):
   decomposer: phase_aware_refined                       # env: CORP_DIAG_DECOMPOSER
-  no_portfolio_polish: true                             # env: CORP_DIAG_NO_PORTFOLIO_POLISH  (always true in diag scope)
+  no_portfolio_polish: false                             # env: CORP_DIAG_NO_PORTFOLIO_POLISH  (always true in diag scope)
   no_per_trailhead_polish: false                        # env: CORP_DIAG_NO_PER_TRAILHEAD_POLISH
   max_concurrency: 12                                   # env: CORP_DIAG_MAX_CONCURRENCY

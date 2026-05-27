@@ -206,7 +206,11 @@ class ChatRecipeTrailhead(BaseModel):
     trailhead_id: str
     title: str
     claim: str
-    kill_chain_phase: _ChatRecipeKillChainPhase
+    # Stage 9.2: default to "bridge" so Pydantic accepts LLM output that
+    # omits the field (bridge prompt doesn't instruct it). Post-processing
+    # always overrides this value (per-phase calls set to phase; bridge
+    # sets to "bridge"). Parallel-mirror of wolfpack's same fix.
+    kill_chain_phase: _ChatRecipeKillChainPhase = "bridge"
     source_technique_ids: list[str] = Field(default_factory=list)
     expected_signals: list[str] = Field(default_factory=list)
     observables: list[str] = Field(default_factory=list)
@@ -493,6 +497,63 @@ If the trailhead is already strong on every item, return it unchanged.
 # Output
 
 Produce a `GeneratorOutput` JSON containing exactly ONE trailhead (the revised version of the input trailhead). Preserve the input's `trailhead_id`. Do not include `portfolio_notes`. Set `self_grade` to `null`.
+"""
+
+
+# Stage 9.3 — portfolio polish prompt (mirror of wolfpack's
+# trailheads/prompts/phase_aware_refined/portfolio_polish.md).
+PROMPT_PORTFOLIO_POLISH = """You are a senior threat-hunt portfolio reviewer. You receive a draft trailhead portfolio + the source threat reports + the rubric A-range gates. Your job is to emit a **revised portfolio** that passes all A-range gates and maximizes rubric score.
+
+This is the final review pass before the portfolio is shipped. Treat it like a code review on production hunt content — be picky, be specific, and emit only the changes that improve rubric score.
+
+# What you have
+
+## Draft portfolio (each trailhead in markdown form)
+
+{{DRAFT_PORTFOLIO}}
+
+## Source threat reports
+
+{{THREAT_REPORTS}}
+
+# Rubric A-range gates (ALL must pass)
+
+1. **Source fidelity ≥ 8/10**. Every claim traces back to behavior the report describes. No invented techniques, no unsupported persistence/lateral/credential angles when the report doesn't describe them.
+2. **No central trailhead unsupported**. Primaries and the bridge must be backed by report content.
+3. **Bridge preserved**. The campaign's main durable cross-phase bridge is present with explicit scored-overlap, entity-resolution joins, time window, and degraded mode.
+4. **IOCs as enrichment**. Domains, hashes, filenames, sender addresses, malware family names are NOT in the core claim text — they're in enrichment fields only.
+5. **Primaries materially distinct**. No two primaries say essentially the same thing. Wording variants of the same idea are caught by the duplicate-materialization rule and cap at B.
+
+# What to fix when revising
+
+For each trailhead in the draft, check:
+
+- **Claim quality**: behavior-first composition pattern (2-3 contextual signals)? OS-primitive / analyst-vocabulary names used when the report describes them? IOCs absent from claim text?
+- **Joins / window**: explicit entity-resolution? Time window stated? Window grounded in the report's own guidance if present?
+- **Telemetry realism**: primary source + degraded-mode fallback specified?
+- **FP controls**: 3-5 explicit suppressions on primaries, 5+ on the bridge? Concrete and named, not vague?
+- **Source grounding**: ties the claim to actual report content? If a claim has no grounding, either find it in the report or DELETE the trailhead.
+- **Portfolio value**: this trailhead adds a distinct hunt angle, or it's a duplicate of another trailhead in the bundle?
+
+For portfolio-level checks:
+
+- **Chain coverage breadth**: do we preserve the report's meaningful stages? Are we missing a stage the report clearly describes?
+- **Post-foothold supporting**: if the report describes any *post-foothold* tradecraft on already-compromised hosts (injection, migration, persistence, lateral movement), is there a *gated supporting* tied to an earlier primary? This is one of the highest-value supportings under the rubric and should be present when the report supports it.
+- **True-duplicate materialization**: are there two trailheads expressing the same analytic idea with only wording differences? If so, KEEP the stronger one and DROP the weaker one.
+
+# Output
+
+Produce a revised `GeneratorOutput` containing the full revised portfolio:
+
+- Keep the primaries (one per phase + the bridge); revise each in place to address rubric weaknesses you identified.
+- Keep, revise, or drop supportings per the checks above. Add a new gated post-foothold supporting if the report supports it and the draft is missing one.
+- Do NOT add new primaries unrelated to the draft. Do NOT introduce behaviors the report doesn't describe.
+- Do NOT change a trailhead's role from primary to supporting (or vice versa) unless the original role was clearly wrong.
+- Preserve the trailhead IDs from the draft when possible; new trailheads (e.g., a new gated supporting) get fresh IDs.
+
+Set `self_grade` to `null`. Do not include `portfolio_notes`.
+
+Produce the complete revised portfolio — every trailhead, not just the ones you changed.
 """
 
 
@@ -1008,6 +1069,55 @@ def _claim_overlap(a: ChatRecipeTrailhead, b: ChatRecipeTrailhead) -> float:
     inter = ta & tb
     union = ta | tb
     return len(inter) / len(union) if union else 0.0
+
+
+def dedup_candidate_primaries(
+    candidates: list[ChatRecipeTrailhead],
+    overlap_threshold: float = 0.55,
+) -> tuple[list[ChatRecipeTrailhead], list[ChatRecipeTrailhead]]:
+    """Stage 10.1 — deterministic role demotion via cross-phase claim overlap.
+
+    The phase-aware decomposer picks one candidate primary per phase. Some
+    phases produce a primary that behaviorally overlaps a stronger primary
+    from another phase (e.g., container_delivery anchors on "fresh
+    user-writable path + extracted container" which is the same primitive
+    as the execution primary's rundll32 chain). The rubric's "primaries
+    materially distinct" A-range gate caps such portfolios at B+.
+
+    Algorithm:
+    - Sort by `_score_trailhead` descending. Ties broken by stable order
+      then by trailhead_id (deterministic).
+    - Promote the highest-scoring candidate.
+    - For each subsequent candidate, compare its claim against every
+      already-promoted primary. If any overlap >= overlap_threshold,
+      demote it (flip `role` to "supporting_detection") and add to the
+      demoted list. Otherwise promote.
+
+    Returns (promoted_primaries, demoted_to_supporting). Caller is
+    responsible for adding the demoted ones to the supporting bucket.
+
+    Pure function — no LLM, no I/O. Reuses _claim_overlap so the
+    threshold matches the existing supporting-vs-primary dedup at the
+    per-phase-supporting layer.
+    """
+    if not candidates:
+        return [], []
+
+    # Sort by score desc, then by trailhead_id asc for determinism.
+    ordered = sorted(
+        candidates,
+        key=lambda t: (-_score_trailhead(t), t.trailhead_id),
+    )
+
+    promoted: list[ChatRecipeTrailhead] = []
+    demoted: list[ChatRecipeTrailhead] = []
+    for cand in ordered:
+        if any(_claim_overlap(cand, p) >= overlap_threshold for p in promoted):
+            cand.role = "supporting_detection"
+            demoted.append(cand)
+        else:
+            promoted.append(cand)
+    return promoted, demoted
 
 
 def _render_primary_summary(t: ChatRecipeTrailhead) -> str:
@@ -1542,6 +1652,123 @@ def invoke_per_trailhead_polish(
         )
 
 
+def invoke_portfolio_polish(
+    llm: ChatOpenAI,
+    *,
+    draft: list[ChatRecipeTrailhead],
+    threat_reports_block: str,
+    metrics_writer: lib.MetricsWriter,
+    config: lib.Config,
+    ledger: lib.StatusLedger | None = None,
+    report_id: str | None = None,
+    run_id: str | None = None,
+) -> list[ChatRecipeTrailhead]:
+    """Stage 9.3 — Portfolio polish: one LLM call over the assembled
+    draft portfolio + source reports + A-range rubric gates.
+
+    Returns the revised trailhead list on success; falls back to the
+    original draft on any failure (graceful degradation, mirroring the
+    per-trailhead polish pattern). Records full CallMetric + ledger row.
+
+    The output is the largest single-shot response in the diag pipeline
+    (full revised portfolio = bridge + ~4 primaries + ~4 supportings),
+    so the initial budget is configurable via
+    `config.llm.portfolio_initial_budget` (defaults 2048) and Layer 2
+    escalation can push it up to 16384.
+    """
+    metric = lib.CallMetric(
+        call_type="portfolio_polish",
+        call_label="portfolio_polish",
+        started_at=lib.iso_utc_now(),
+    )
+    t_start = time.monotonic()
+    # Cache key uses the trailhead-ID set of the draft so identical drafts
+    # reuse a polished output. Polish is intentionally NOT cached today —
+    # the same draft might benefit from a re-roll if the model varies.
+    # Keep batch_key for ledger correlation only.
+    batch_key = lib.compute_call_batch_key(
+        {"trailhead_ids": [t.trailhead_id for t in draft]},
+        call_type="portfolio_polish",
+        prompt_version=_DIAG_DECOMPOSER_PROMPT_VERSION,
+        deployment=config.auth.deployment,
+        max_completion_tokens=config.llm.portfolio_initial_budget,
+    )
+
+    draft_block = "\n\n---\n\n".join(
+        _render_trailhead_for_polish(t) for t in draft
+    )
+    sys_prompt = (
+        PROMPT_PORTFOLIO_POLISH
+        .replace("{{DRAFT_PORTFOLIO}}", draft_block)
+        .replace("{{THREAT_REPORTS}}", threat_reports_block)
+    )
+    user_prompt = (
+        "Review the draft portfolio against the A-range gates and emit a "
+        "revised portfolio that passes all gates and maximizes rubric "
+        "score. Output as a complete GeneratorOutput JSON containing "
+        "ALL revised trailheads (primaries, bridge, supportings)."
+    )
+    metric.prompt_chars = len(sys_prompt) + len(user_prompt)
+    messages = [SystemMessage(content=sys_prompt), HumanMessage(content=user_prompt)]
+
+    def _make_structured_invokable(budget: int):
+        return llm.model_copy(update={"max_tokens": budget}).with_structured_output(
+            ChatRecipeGeneratorOutput, include_raw=True, method="function_calling",
+        )
+
+    try:
+        try:
+            budget_journey: list[int] = []
+            result, escalation_status = lib.invoke_with_token_escalation(
+                invokable_factory=_make_structured_invokable,
+                payload=messages,
+                is_truncated=_is_structured_result_truncated,
+                initial_max_tokens=config.llm.portfolio_initial_budget,
+                escalation_factor=config.llm.escalation_factor,
+                max_attempts=config.llm.escalation_max_attempts,
+                config=config,
+                context="portfolio_polish",
+                attempts=metric.attempts,
+                budget_journey_out=budget_journey,
+            )
+            metric.payload["budget_attempts"] = budget_journey
+            metric.payload["escalation_status"] = escalation_status
+        except Exception as exc:
+            metric.final_status = (
+                "exhausted" if lib.is_transient_error(exc) else "non_transient"
+            )
+            metric.final_error = f"{type(exc).__name__}: {str(exc)[:400]}"
+            raise
+
+        parsed = _process_structured_result(
+            result, None, metric, call_label="portfolio_polish", n_batches=1,
+        )
+        if parsed is None or not parsed.portfolio.trailheads:
+            metric.final_status = "blank"
+            metric.final_error = "portfolio polish returned no trailheads"
+            return draft
+
+        revised = list(parsed.portfolio.trailheads)
+        metric.final_status = "ok"
+        metric.payload["trailheads_in"] = len(draft)
+        metric.payload["trailheads_out"] = len(revised)
+        return revised
+    except Exception:
+        return draft
+    finally:
+        metric.finished_at = lib.iso_utc_now()
+        metric.total_elapsed_s = round(time.monotonic() - t_start, 3)
+        metric.n_attempts = len(metric.attempts)
+        if metric.final_status == "pending":
+            metric.final_status = "unknown"
+        metrics_writer.write(metric)
+        lib.write_decomposer_ledger_entry(
+            ledger=ledger, report_id=report_id, run_id=run_id,
+            call_type="portfolio_polish", batch_key=batch_key,
+            context_label="portfolio_polish", metric=metric,
+        )
+
+
 # ============================================================================
 # Section K — Decomposer orchestration
 # Mirrors PhaseAwareRefinedDecomposer.decompose_all() with --no-portfolio-polish.
@@ -1558,6 +1785,7 @@ def run_decomposer(
     campaign_brief: str,
     max_concurrency: int,
     per_trailhead_polish_enabled: bool,
+    portfolio_polish_enabled: bool,
     metrics_writer: lib.MetricsWriter,
     config: lib.Config,
     # Stage 5g — opt-in cross-run hardening:
@@ -1678,6 +1906,40 @@ def run_decomposer(
         run_meta["n_primaries"] = 0
         return [], run_meta
 
+    # Stage 10.1: deterministic role demotion via cross-phase claim
+    # overlap. Phases that produced a primary substantively overlapping
+    # a stronger phase's primary get their primary demoted to supporting
+    # — addressing the "primaries materially distinct" A-range gate
+    # without needing an LLM call. Demoted ones land in the supporting
+    # bucket alongside the per-phase supportings.
+    #
+    # Threshold 0.30 is lower than the within-phase dedup's 0.55 because
+    # cross-phase primaries describe different stages in different words
+    # but may share the underlying primitive (e.g., container_delivery vs
+    # execution both anchoring on "fresh user-writable extracted path").
+    # 0.30 catches that pair (~0.32 observed) while staying above
+    # incidental overlap floors (~0.15-0.20 for genuinely distinct
+    # primaries).
+    promoted_primaries, demoted_to_supporting = dedup_candidate_primaries(
+        per_phase_primaries, overlap_threshold=0.30,
+    )
+    if demoted_to_supporting:
+        logger.info(
+            "Cross-phase dedup: demoted %d primary candidate(s) to "
+            "supporting — %s",
+            len(demoted_to_supporting),
+            [t.trailhead_id for t in demoted_to_supporting],
+        )
+        per_phase_supporting.extend(demoted_to_supporting)
+        run_meta["primaries_demoted"] = [
+            {"trailhead_id": t.trailhead_id,
+             "kill_chain_phase": t.kill_chain_phase}
+            for t in demoted_to_supporting
+        ]
+    else:
+        run_meta["primaries_demoted"] = []
+    per_phase_primaries = promoted_primaries
+
     per_phase_primaries.sort(key=lambda t: _kill_chain_position(t.kill_chain_phase))
 
     # Step 4: bridge synthesis
@@ -1752,6 +2014,29 @@ def run_decomposer(
         final_chat_trailheads = [
             revised_by_id.get(th.trailhead_id, th) for th in draft_trailheads
         ]
+
+    # Step 7: portfolio polish (optional, single LLM call over the
+    # already-per-trailhead-polished output). Mirrors wolfpack: per-trailhead
+    # first, portfolio second, so portfolio polish operates on the best draft
+    # available.
+    if portfolio_polish_enabled and final_chat_trailheads:
+        logger.info(
+            "Portfolio polish: %d trailheads → one revision pass",
+            len(final_chat_trailheads),
+        )
+        final_chat_trailheads = invoke_portfolio_polish(
+            llm,
+            draft=final_chat_trailheads,
+            threat_reports_block=threat_reports_block,
+            metrics_writer=metrics_writer,
+            config=config,
+            ledger=ledger,
+            report_id=report_id,
+            run_id=run_id,
+        )
+        run_meta["portfolio_polish_applied"] = True
+    else:
+        run_meta["portfolio_polish_applied"] = False
 
     return final_chat_trailheads, run_meta
 
@@ -1866,7 +2151,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    choices=["phase_aware_refined"],
                    help="Decomposer (only phase_aware_refined supported in diag).")
     p.add_argument("--no-portfolio-polish", action="store_true", default=False,
-                   help="(Always on for diag; included for CLI parity.)")
+                   help="Stage 9.3: portfolio polish now defaults ON in the diag "
+                        "(was always off pre-Stage-9.3 due to wall-time concerns "
+                        "that Layer 1+2 + cross-run safety nets have addressed). "
+                        "Pass this flag to opt out.")
     p.add_argument("--no-per-trailhead-polish", action="store_true", default=False,
                    help="Skip per-trailhead polish stage.")
     p.add_argument("--campaign-brief", type=str, default="",
@@ -1913,6 +2201,8 @@ def _cli_to_overrides(args: argparse.Namespace) -> dict[str, Any]:
         overrides["diag.decomposer"] = args.decomposer
     if args.no_per_trailhead_polish:
         overrides["diag.no_per_trailhead_polish"] = True
+    if args.no_portfolio_polish:
+        overrides["diag.no_portfolio_polish"] = True
     if args.max_concurrency is not None:
         overrides["diag.max_concurrency"] = args.max_concurrency
     if args.max_completion_tokens is not None:
@@ -2006,6 +2296,7 @@ def main(argv: list[str] | None = None) -> int:
             campaign_brief=args.campaign_brief,
             max_concurrency=config.diag.max_concurrency,
             per_trailhead_polish_enabled=not config.diag.no_per_trailhead_polish,
+            portfolio_polish_enabled=not config.diag.no_portfolio_polish,
             metrics_writer=metrics_writer,
             config=config,
             ledger=ledger,

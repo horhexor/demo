@@ -172,3 +172,110 @@ Key observations:
 - The bridge `schema_fail` (pydantic missing `kill_chain_phase` field) is a
   *consistent* failure across baseline + chaos. It is independent of
   resilience and should be tracked as a separate prompt quality bug.
+  **Update Stage 9.2: fixed.** `ChatRecipeTrailhead.kill_chain_phase` now
+  defaults to `"bridge"`, so Pydantic accepts LLM output that omits the
+  field; post-processing overrides to the real phase on per-phase calls
+  and to `"bridge"` on the bridge call. Verified live: bridge call goes
+  from `schema_fail` → `ok` in every chaos profile.
+
+## Stage 9-10 results (post-bridge-fix, post-dedup)
+
+Three additive changes after Stage 8.2:
+
+1. **Stage 9.2 — bridge schema fix.** Pydantic default for
+   `kill_chain_phase`. Bridge call now reliably emits a trailhead.
+2. **Stage 9.3 — portfolio polish wired into diag.** Previously
+   intentionally skipped (`--no-portfolio-polish` was always on); now
+   defaults ON to mirror wolfpack. Adds an LLM call after per-trailhead
+   polish.
+3. **Stage 10.1 — deterministic cross-phase role demotion.** New pure
+   function `dedup_candidate_primaries(candidates, threshold=0.30)` runs
+   before the bridge call. Demotes any phase primary whose claim has
+   token-Jaccard overlap ≥ 0.30 with a stronger already-promoted primary,
+   flipping its role to `supporting_detection`. Addresses the "primaries
+   materially distinct" A-range gate at zero LLM cost.
+
+### Measured results on cobalt-strike (same fixture as Stage 8.2)
+
+| Configuration | Trailheads | Wall time | Polish LLM | Dedup demoted | Bridge ok? | Est. grade |
+|---|---|---|---|---|---|---|
+| Stage 8.2 unpolished (no dedup, broken bridge) | 8 (4P + 4S) | 67s | none | n/a | ✗ schema_fail | B (~82) |
+| Stage 9.3 polish only (no dedup) | 9–10 (5P + 4S, polish adds 1) | 460s | 345s (4 attempts, last 137s) | n/a | ✓ | B+/A- (~87) |
+| **Stage 10.1 dedup only (no polish)** | **9 (4P + 5S)** | **68s** | none | container_delivery | ✓ | **A- (~90)** |
+| Stage 10.1 dedup + polish | 10 (4P + 6S) | 297s | 234s | container_delivery | ✓ | A (~92) |
+
+**Dedup alone (no polish) delivers A- structure at baseline cost.** Polish
+adds content polish (~+2 rubric points: tighter FP controls, added
+post-foothold gated supporting) but at ~4× wall time.
+
+### Dedup chaos validation (cobalt-strike)
+
+| Profile | Per-phase ok | Dedup fired | Bridge | Total | Wall | Notes |
+|---|---|---|---|---|---|---|
+| baseline | 4/4 | ✓ container_delivery | ✓ | 9 | 68s | reference |
+| chaos B | 4/4 (with Layer 1+2 recovery) | ✓ container_delivery | ✓ | 9 | 235s | identical structure |
+| chaos C | 3/4 (execution → truncation_exhausted) | skipped (only 3 candidates) | ✓ | 7 | 320s | cross-run retry handles |
+
+Under chaos B, dedup demoted the same trailhead and produced the same
+structure as baseline. Under chaos C the execution phase was lost to
+extreme truncation (Layer 2 exhausted at 8192 budget); dedup correctly
+operates on the surviving 3 phases without manufacturing demotions out
+of thin air. The cross-run StatusLedger records execution as
+`truncation_exhausted` for retry on rerun.
+
+### Dedup generalization to nobelium-campaign (different reports)
+
+Generated fresh upstream fixture via `wolfpack-plan` against the
+nobelium reports. **7 phases discovered** (vs cobalt's 4):
+initial_access, container_delivery, execution, defense_evasion,
+persistence, command_and_control, redirect.
+
+| Promoted primary (5) | Score | Demoted primary | Reason |
+|---|---|---|---|
+| container_delivery | 104.1 | — | — |
+| execution | 104.0 | — | — |
+| bridge (wolfpack upstream-emitted) | 103.7 | — | — |
+| **defense_evasion** | **103.4** | ✗ **demoted** | **overlap 0.35 with execution** |
+| command_and_control | 103.2 | — | — |
+| initial_access | 98.8 | — | — |
+
+Plus diag-synthesized cross-phase bridge → 6 primaries + 6 supportings,
+99.8s wall time. All 5 promoted primaries have full A-range field
+completeness (5 FP controls + degraded_mode + source_grounding +
+joins_windows).
+
+**The 0.30 threshold reliably catches the semantically-redundant phase
+in both campaigns** (cobalt: container_delivery↔execution at 0.32;
+nobelium: defense_evasion↔execution at 0.35). Genuinely distinct
+primaries have overlap ≤0.20.
+
+### What still hasn't been validated
+
+- **Corp APIM at real wall-time variance.** All numbers above are from
+  the local mimic. The Stage 9.3 polish-on result (137s for the
+  successful polish attempt) almost certainly won't fit corp's
+  unpredictable cap. Recommended corp posture: **dedup ON, portfolio
+  polish OFF** (matches diag's old default but now structurally
+  correct). Use `CORP_DIAG_NO_PORTFOLIO_POLISH=true`.
+- **chaos B/C with polish ON.** Not run. The polish LLM call would
+  compound on top of chaos. Likely high failure rate; cross-run retry
+  expected to recover. Worth a corp data point if polish is enabled.
+- **Other peer campaigns** (volt-typhoon, salt-typhoon, brickstorm).
+  Same pattern expected but unconfirmed.
+- **Edge cases of dedup threshold.** A campaign with 4 truly distinct
+  primaries where one pair coincidentally hits ~0.30 overlap (e.g.,
+  shared vocabulary on a specific tool name) would suffer a false
+  demotion. Currently no telemetry exposes the overlap matrix —
+  recommended follow-up: log the full primary-vs-primary overlap
+  matrix when dedup fires, so corp runs can audit decisions.
+
+### Drift safeguards
+
+- `apim-diag/test_wolfpack_diag_drift.py` — pins llm_resilience primitives
+  (12 tests). Verified still green.
+- `apim-diag/test_wolfpack_diag_decomposer_drift.py` — pins decomposer
+  primitives (`ChatRecipeTrailhead` schema, `dedup_candidate_primaries`
+  behavior). 8 tests, includes parametrized behavioral equivalence
+  scenarios on 5 inputs. Verifies wolfpack's dedup and diag's dedup
+  produce identical promote/demote decisions on the same input. Drift
+  between wolfpack and apim-diag dedup logic would fail this test.

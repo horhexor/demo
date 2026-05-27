@@ -88,7 +88,7 @@ _SRC_DEFAULT = "default"
 
 @dataclasses.dataclass
 class AuthConfig:
-    endpoint: str = "https://<your-apim>.azure-api.net/openai-compat"
+    endpoint: str = "https://apim-<your-corp-apim>.azure-api.net/openai-compat"
     deployment: str = "gpt-5-4"
     api_version: str = "2024-12-01-preview"
     api_surface: str = "openai-compat"
@@ -109,6 +109,10 @@ class LLMConfig:
     per_phase_initial_budget: int = 1024
     bridge_initial_budget: int = 2048
     polish_initial_budget: int = 1024
+    # Stage 9.3 — portfolio polish output is the largest (full revised
+    # portfolio: bridge + N primaries + M supportings), so it gets a
+    # larger initial budget than per-trailhead polish.
+    portfolio_initial_budget: int = 2048
 
 
 @dataclasses.dataclass
@@ -141,7 +145,7 @@ class MimicLoadPreset:
 class MimicConfig:
     host: str = "127.0.0.1"
     port: int = 8080
-    foundry_endpoint: str = "https://<your-foundry>.openai.azure.com"
+    foundry_endpoint: str = "https://aoai-<your-foundry>.openai.azure.com"
     api_version: str = "2024-12-01-preview"
     load_mode: str | None = None
     delay_min_ms: int = 0
@@ -161,7 +165,12 @@ class DiagConfig:
     extract_batch_size: int = 1
     extract_concurrency: int = 8
     decomposer: str = "phase_aware_refined"
-    no_portfolio_polish: bool = True
+    # Stage 9.3: default flipped from True → False. Portfolio polish was
+    # historically skipped because corp APIM's wall-time cap made the
+    # ~30-40s call unreliable. With Layer 1 + Layer 2 escalation and the
+    # cross-run StatusLedger + BatchCache safety nets, polish is now
+    # viable in the diag pipeline (mirrors wolfpack's polish_enabled=True).
+    no_portfolio_polish: bool = False
     no_per_trailhead_polish: bool = False
     max_concurrency: int = 12
     # Stage 5g — opt-in cross-run hardening for decomposer:
@@ -219,7 +228,7 @@ _CONFIG_SCHEMA: tuple[tuple[str, str | None, Any, type], ...] = (
     ("profile.source",                  "CORP_DIAG_PROFILE_SOURCE",    "yaml",        str),
     ("profile.yaml_path",               "LLM_PROFILES_PATH",           None,          str),
     # auth (only used when profile.source == "inline")
-    ("auth.endpoint",                   "AZURE_OPENAI_ENDPOINT",       "https://<your-apim>.azure-api.net/openai-compat", str),
+    ("auth.endpoint",                   "AZURE_OPENAI_ENDPOINT",       "https://apim-<your-corp-apim>.azure-api.net/openai-compat", str),
     ("auth.deployment",                 "AZURE_OPENAI_DEPLOYMENT",     "gpt-5-4",     str),
     ("auth.api_version",                "AZURE_OPENAI_API_VERSION",    "2024-12-01-preview", str),
     ("auth.api_surface",                "CORP_DIAG_API_SURFACE",       "openai-compat", str),
@@ -237,6 +246,7 @@ _CONFIG_SCHEMA: tuple[tuple[str, str | None, Any, type], ...] = (
     ("llm.per_phase_initial_budget",    "CORP_DIAG_PER_PHASE_INITIAL_BUDGET", 1024,   int),
     ("llm.bridge_initial_budget",       "CORP_DIAG_BRIDGE_INITIAL_BUDGET", 2048,      int),
     ("llm.polish_initial_budget",       "CORP_DIAG_POLISH_INITIAL_BUDGET", 1024,      int),
+    ("llm.portfolio_initial_budget",    "CORP_DIAG_PORTFOLIO_INITIAL_BUDGET", 2048,   int),
     # chaos
     ("chaos.token_chaos_rate",          "CORP_DIAG_TOKEN_CHAOS_RATE",  0.0,           float),
     ("chaos.token_chaos_error",         "CORP_DIAG_TOKEN_CHAOS_ERROR", "random",      str),
@@ -244,7 +254,7 @@ _CONFIG_SCHEMA: tuple[tuple[str, str | None, Any, type], ...] = (
     # mimic
     ("mimic.host",                      "MIMIC_HOST",                  "127.0.0.1",   str),
     ("mimic.port",                      "MIMIC_PORT",                  8080,          int),
-    ("mimic.foundry_endpoint",          "MIMIC_FOUNDRY_ENDPOINT",      "https://<your-foundry>.openai.azure.com", str),
+    ("mimic.foundry_endpoint",          "MIMIC_FOUNDRY_ENDPOINT",      "https://aoai-<your-foundry>.openai.azure.com", str),
     ("mimic.api_version",               "MIMIC_API_VERSION",           "2024-12-01-preview", str),
     ("mimic.load_mode",                 "MIMIC_LOAD_MODE",             None,          str),
     ("mimic.delay_min_ms",              "MIMIC_DELAY_MIN_MS",          0,             int),
@@ -260,7 +270,7 @@ _CONFIG_SCHEMA: tuple[tuple[str, str | None, Any, type], ...] = (
     ("diag.extract_batch_size",         "CORP_DIAG_EXTRACT_BATCH_SIZE", 1,            int),
     ("diag.extract_concurrency",        "CORP_DIAG_EXTRACT_CONCURRENCY", 8,           int),
     ("diag.decomposer",                 "CORP_DIAG_DECOMPOSER",        "phase_aware_refined", str),
-    ("diag.no_portfolio_polish",        "CORP_DIAG_NO_PORTFOLIO_POLISH", True,        bool),
+    ("diag.no_portfolio_polish",        "CORP_DIAG_NO_PORTFOLIO_POLISH", False,       bool),
     ("diag.no_per_trailhead_polish",    "CORP_DIAG_NO_PER_TRAILHEAD_POLISH", False,   bool),
     ("diag.max_concurrency",            "CORP_DIAG_MAX_CONCURRENCY",   12,            int),
     # Stage 5g — opt-in cross-run hardening for the decomposer phase
