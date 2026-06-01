@@ -1,0 +1,15 @@
+# Python 3.11+ recommended.
+#
+# Deterministic mode (`--llm none`) uses only the Python standard library.
+# These packages are needed for `--llm azure-apim` and local verification.
+
+# Azure bearer-token auth used by DefaultAzureCredential and
+# get_bearer_token_provider(..., "https://ai.azure.com/.default").
+azure-identity>=1.25,<2.0
+
+# ChatOpenAI client used against APIM or apim-mimic.
+langchain-core>=1.3.2,<2.0
+langchain-openai>=1.2,<2.0
+
+# Test runner for test_lock_kb_insights.py and test_fetch_ruleset.py.
+pytest>=9.0,<10.0
